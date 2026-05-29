@@ -5,6 +5,26 @@ Each entry lists the file, the upstream function, the change, and
 the rationale. Crypto code (`src/crypto/refc/*`) is bit-identical to
 upstream — no entries here for it.
 
+## Version history
+
+* **v0.1.1** — Reverted ALL `pbuf_alloc(PBUF_POOL)` changes from
+  v0.1.0 (handshake init/response/cookie + transport TX/RX). Under
+  live keepalive traffic the v0.1.0 build tripped a
+  `multi_heap_free` assert at ~60 s into a tunnel: the lwIP UDP
+  send path's internal pbuf_take/free interaction with a pool-backed
+  pbuf doesn't preserve the refcount model the upstream code relies
+  on. PBUF_RAM (heap-backed) tolerates the same handoff because the
+  caller-owns-payload invariant holds. Kept the static
+  `wireguard_device` BSS instance change — that one is independent
+  of the pbuf lifecycle and worked cleanly. Saves ~1.1 KB of
+  per-cycle max_alloc residue; the per-packet pbuf churn savings
+  the PBUF_POOL change targeted are deferred until we have a deeper
+  analysis of lwIP's pbuf refcount path.
+
+* **v0.1.0** — Initial fork. (`pbuf_alloc → PBUF_POOL` everywhere,
+  plus `wireguard_device → BSS`.) Asserts on live tunnel — DO NOT
+  USE. Bumped pinning to v0.1.1 in `WireGuardModule`.
+
 ## `src/wireguardif.c`
 
 ### `wireguardif_initiate_handshake` (line ~413)

@@ -1,6 +1,6 @@
 {
   "name": "WireGuard-ESPRack",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Static-allocation fork of WireGuard-ESP32-Arduino. Drop-in API compatible with ciniml/francescolavra forks; eliminates heap allocations in the handshake + transport hot paths so the WireGuard tunnel doesn't fragment heap on every up/down cycle. Designed for ESP32-C3 deployments with tight contiguous-heap budgets.",
   "keywords": "wireguard, vpn, network, esp32, esp32-c3, static-allocation",
   "authors": [

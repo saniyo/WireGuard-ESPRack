@@ -174,26 +174,21 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 			// The buffer needs to be allocated from "transport" pool to leave room for LwIP generated IP headers
 			// The IP packet consists of 16 byte header (struct message_transport_data), data padded upto 16 byte boundary + encrypted auth tag (16 bytes)
 			//
-			// ESPRack fork: PBUF_POOL when total size fits in a single
-			// PBUF_POOL_BUFSIZE entry (so payload stays contiguous),
-			// otherwise fall back to PBUF_RAM. The encrypt path below
-			// dereferences pbuf->payload across the full header+padded+
-			// authtag range and would corrupt memory if lwIP chained
-			// multiple pool entries. For typical WG MTU=1420 the POOL
-			// path is hit on every packet — no heap allocation for
-			// steady-state traffic. Atypical configs (very large MTU)
-			// degrade gracefully back to the upstream PBUF_RAM path.
-			{
-				const u16_t wg_tx_total = header_len + padded_len + WIREGUARD_AUTHTAG_LEN;
-				pbuf = (wg_tx_total <= PBUF_POOL_BUFSIZE)
-					? pbuf_alloc(PBUF_TRANSPORT, wg_tx_total, PBUF_POOL)
-					: pbuf_alloc(PBUF_TRANSPORT, wg_tx_total, PBUF_RAM);
-			}
+			// ESPRack fork v0.1.1: REVERTED to PBUF_RAM. An earlier
+			// attempt routed this through PBUF_POOL when total ≤ pool
+			// bufsize; under live keepalive + transport traffic that
+			// triggered a multi_heap_free assert (refcount mismatch on
+			// the pbuf hand-off into the lwIP UDP send path). The
+			// reference-counting interaction between PBUF_POOL and
+			// udp_send_to_if_src's internal pbuf_take/free was where
+			// the upstream lib's assumption "payload is one heap block
+			// the caller fully owns" leaked through. Keeping PBUF_RAM
+			// here preserves the upstream invariant exactly.
+			pbuf = pbuf_alloc(PBUF_TRANSPORT, header_len + padded_len + WIREGUARD_AUTHTAG_LEN, PBUF_RAM);
 			if (pbuf) {
 				log_v(TAG "preparing transport data...");
-				// The allocation above either fit in one PBUF_POOL slot
-				// (contiguous) or used PBUF_RAM (also contiguous) — payload
-				// is a single contiguous region either way.
+				// Note: allocating pbuf from RAM above guarantees that the pbuf is in one section and not chained
+				// - i.e payload points to the contiguous memory region
 				memset(pbuf->payload, 0, pbuf->tot_len);
 
 				hdr = (struct message_transport_data *)pbuf->payload;
@@ -346,16 +341,9 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 
 			// We don't know the unpadded size until we have decrypted the packet and validated/inspected the IP header
 			//
-			// ESPRack fork: PBUF_POOL when the decrypted size fits in a
-			// single pool slot; PBUF_RAM otherwise. Same contiguity
-			// guard as the TX path — the decrypt below dereferences
-			// pbuf->payload across the whole length.
-			{
-				const u16_t wg_rx_total = src_len - WIREGUARD_AUTHTAG_LEN;
-				pbuf = (wg_rx_total <= PBUF_POOL_BUFSIZE)
-					? pbuf_alloc(PBUF_TRANSPORT, wg_rx_total, PBUF_POOL)
-					: pbuf_alloc(PBUF_TRANSPORT, wg_rx_total, PBUF_RAM);
-			}
+			// ESPRack fork v0.1.1: REVERTED to PBUF_RAM. Same pbuf
+			// refcount + lwIP-handoff lifecycle issue as the TX path.
+			pbuf = pbuf_alloc(PBUF_TRANSPORT, src_len - WIREGUARD_AUTHTAG_LEN, PBUF_RAM);
 			if (pbuf) {
 				// Decrypt the packet
 				memset(pbuf->payload, 0, pbuf->tot_len);
@@ -452,15 +440,11 @@ static struct pbuf *wireguardif_initiate_handshake(struct wireguard_device *devi
 	err_t err = ERR_OK;
 	if (wireguard_create_handshake_initiation(device, peer, msg)) {
 		// Send this packet out!
-		// ESPRack fork: PBUF_POOL instead of PBUF_RAM. The handshake
-		// initiation message is exactly sizeof(struct ...) bytes — fits
-		// in a single PBUF_POOL_BUFSIZE entry. The alloc comes from
-		// lwIP's MEMP_PBUF_POOL (BSS-backed, pre-allocated at boot)
-		// instead of the system heap, eliminating the alloc-free
-		// fragmentation hole we measured on ESP32-C3.
-		// If the pool is exhausted, drop — WG's retry timer (~5 s)
-		// will fire another initiation. Better than fragmenting heap.
-		pbuf = pbuf_alloc(PBUF_TRANSPORT, sizeof(struct message_handshake_initiation), PBUF_POOL);
+		// ESPRack fork v0.1.1: kept upstream PBUF_RAM. Tried PBUF_POOL
+		// in v0.1.0; tripped a multi_heap_free assert at ~60 s into a
+		// live tunnel because the pbuf refcount lifecycle through lwIP
+		// UDP send path doesn't survive the alloc-source swap cleanly.
+		pbuf = pbuf_alloc(PBUF_TRANSPORT, sizeof(struct message_handshake_initiation), PBUF_RAM);
 		if (pbuf) {
 			err = pbuf_take(pbuf, msg, sizeof(struct message_handshake_initiation));
 			if (err == ERR_OK) {
@@ -491,9 +475,9 @@ static void wireguardif_send_handshake_response(struct wireguard_device *device,
 		wireguard_start_session(peer, false);
 
 		// Send this packet out!
-		// ESPRack fork: PBUF_POOL — same rationale as the handshake
-		// initiation site above.
-		pbuf = pbuf_alloc(PBUF_TRANSPORT, sizeof(struct message_handshake_response), PBUF_POOL);
+		// ESPRack fork v0.1.1: kept upstream PBUF_RAM. See the comment
+		// at wireguardif_initiate_handshake for why PBUF_POOL was reverted.
+		pbuf = pbuf_alloc(PBUF_TRANSPORT, sizeof(struct message_handshake_response), PBUF_RAM);
 		if (pbuf) {
 			err = pbuf_take(pbuf, &packet, sizeof(struct message_handshake_response));
 			if (err == ERR_OK) {
@@ -544,9 +528,9 @@ static void wireguardif_send_handshake_cookie(struct wireguard_device *device, c
 	wireguard_create_cookie_reply(device, &packet, mac1, index, source_buf, source_len);
 
 	// Send this packet out!
-	// ESPRack fork: PBUF_POOL — cookie reply is fixed size, fits in
-	// one pool slot. Same fragmentation-avoidance rationale.
-	pbuf = pbuf_alloc(PBUF_TRANSPORT, sizeof(struct message_cookie_reply), PBUF_POOL);
+	// ESPRack fork v0.1.1: kept upstream PBUF_RAM. See the comment at
+	// wireguardif_initiate_handshake for why PBUF_POOL was reverted.
+	pbuf = pbuf_alloc(PBUF_TRANSPORT, sizeof(struct message_cookie_reply), PBUF_RAM);
 	if (pbuf) {
 		err = pbuf_take(pbuf, &packet, sizeof(struct message_cookie_reply));
 		if (err == ERR_OK) {
